@@ -342,3 +342,58 @@ implementation details away from the public API.
 The goal for this major revision is to improve upon all the benefits of, while
 addressing all the shortcomings of the old API. We hope that it will serve the
 Go ecosystem well for the next 10 years and beyond.
+
+## NEW FEATURE
+Add a tag comment to the message in the proto file to add the struct tag in go:
+```protobuf
+// @tag-camel-case json
+// @tag-snake-case db
+message User {
+    int64 id = 1;
+    string username = 2;
+    string phoneNum = 3;
+}
+```
+The resulting struct is as follows:
+```go
+// @tag-camel-case json
+// @tag-snake-case db
+type User struct {
+    state         protoimpl.MessageState
+    sizeCache     protoimpl.SizeCache
+    unknownFields protoimpl.UnknownFields
+    
+    Id          int64  `protobuf:"varint,1,opt,name=id,proto3" json:"id" db:"id"`
+    Username    string `protobuf:"bytes,2,opt,name=username,proto3" json:"username" db:"username"`
+    PhoneNum    string `protobuf:"bytes,9,opt,name=phoneNum,proto3" json:"phoneNum" db:"phone_num"`
+}
+```
+A tag added above message causes all fields to have that tag added.
+In addition, you can also add a separate tag to the field：
+```protobuf
+// @tag-camel-case json
+message Login {
+  // @tag validate:"required,min=8,max=20"
+  string username = 1;
+  // @tag validate:"required,len=32"
+  string password = 2;
+}
+```
+The resulting struct is as follows:
+```go
+// @tag-camel-case json
+type Login struct {
+    state         protoimpl.MessageState
+    sizeCache     protoimpl.SizeCache
+    unknownFields protoimpl.UnknownFields
+    
+    // @tag validate:"required,min=8,max=20"
+    Username string `protobuf:"bytes,1,opt,name=Username,proto3" json:"username" validate:"required,min=8,max=20"`
+    // @tag validate:"required,len=32"
+    Password string `protobuf:"bytes,2,opt,name=Password,proto3" json:"password" validate:"required,len=32"`
+}
+```
+Three types of tag are supported on message, as follows:
+- @tag-camel-case: Generates the variable name of the hump type
+- @tag-pascal-case: generates the variable name of the PASCAL type
+- @tag-snake-case: Generates the variable name of the underline partition type
