@@ -11,6 +11,7 @@ import (
 	"go/parser"
 	"go/token"
 	"math"
+	"os"
 	"strconv"
 	"strings"
 	"unicode"
@@ -63,6 +64,48 @@ var (
 	protoreflectPackage  goImportPath = protogen.GoImportPath("google.golang.org/protobuf/reflect/protoreflect")
 	protoregistryPackage goImportPath = protogen.GoImportPath("google.golang.org/protobuf/reflect/protoregistry")
 )
+
+type NameFunc func(string) string
+
+type TagNameFunc struct {
+	tag string
+	fn  NameFunc
+}
+
+var (
+	// tag注解，可以用于message的字段上，用于添加结构体注释
+	// 比如： @tag json:"id"
+	tagField = "@tag"
+
+	// tag注解，可以用于message上，用于统一生成某种注释
+	// 比如： @tag-camel-case json
+	// 将为结构体的所有字段生成驼峰式的tag
+	tagMessage = map[string]NameFunc{
+		"@tag-camel-case":  ToCamelCase,
+		"@tag-pascal-case": ToCamelCase,
+		"@tag-snake-case":  ToSnakeCase,
+	}
+)
+
+var (
+	output *os.File
+	debug  = true
+)
+
+func init() {
+	var err error
+	output, err = os.OpenFile("protobuf.log", os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "open log file error: %v", err)
+		os.Exit(1)
+	}
+}
+
+func logf(format string, a ...interface{}) {
+	if debug {
+		fmt.Fprintf(output, format, a...)
+	}
+}
 
 type goImportPath interface {
 	String() string
@@ -341,17 +384,43 @@ func genMessage(g *protogen.GeneratedFile, f *fileInfo, m *messageInfo) {
 	g.P("}")
 	g.P()
 
+	logf("r count: %d, n count:%d\n", strings.Count(m.Comments.Leading.String(), "\r"), strings.Count(m.Comments.Leading.String(), "\n"))
+
 	genMessageKnownFunctions(g, f, m)
 	genMessageDefaultDecls(g, f, m)
 	genMessageMethods(g, f, m)
 	genMessageOneofWrapperTypes(g, f, m)
 }
 
+func getMessageTag(m *messageInfo) (res []TagNameFunc) {
+	comments := strings.Split(m.Comments.Leading.String(), "//")
+	for _, comment := range comments {
+		comment = strings.Trim(comment, " \r\n")
+		for k, _ := range tagMessage {
+			if strings.Contains(comment, k) {
+				fn := tagMessage[k]
+				i := strings.Index(comment, k) + len(k)
+				tg := strings.Trim(comment[i:], " ")
+				res = append(res, TagNameFunc{
+					tag: tg,
+					fn:  fn,
+				})
+				break
+			}
+		}
+	}
+
+	return
+}
+
 func genMessageFields(g *protogen.GeneratedFile, f *fileInfo, m *messageInfo) {
 	sf := f.allMessageFieldsByPtr[m]
 	genMessageInternalFields(g, f, m, sf)
+	// 判断是否要生成tag
+	tagFns := getMessageTag(m)
+
 	for _, field := range m.Fields {
-		genMessageField(g, f, m, field, sf)
+		genMessageField(g, f, m, field, sf, tagFns)
 	}
 }
 
@@ -375,7 +444,7 @@ func genMessageInternalFields(g *protogen.GeneratedFile, f *fileInfo, m *message
 	}
 }
 
-func genMessageField(g *protogen.GeneratedFile, f *fileInfo, m *messageInfo, field *protogen.Field, sf *structFields) {
+func genMessageField(g *protogen.GeneratedFile, f *fileInfo, m *messageInfo, field *protogen.Field, sf *structFields, tagFns []TagNameFunc) {
 	if oneof := field.Oneof; oneof != nil && !oneof.Desc.IsSynthetic() {
 		// It would be a bit simpler to iterate over the oneofs below,
 		// but generating the field here keeps the contents of the Go
@@ -411,10 +480,47 @@ func genMessageField(g *protogen.GeneratedFile, f *fileInfo, m *messageInfo, fie
 	if pointer {
 		goType = "*" + goType
 	}
+
+	commentTags := make(map[string]string)
+	// 处理message上注释中的tag
+	for _, tf := range tagFns {
+		if tf.tag != "" && tf.fn != nil {
+			commentTags[tf.tag] = tf.fn(field.GoName)
+		}
+	}
+
+	// 处理message字段上注释中的tag
+	comments := strings.Split(strings.Trim(field.Comments.Leading.String(), "\r\n"), "//")
+	logf("comments: %v\n", comments)
+	for _, comment := range comments {
+		if !strings.Contains(comment, tagField) {
+			continue
+		}
+		i := strings.Index(comment, tagField) + len(tagField)
+		tagStr := strings.TrimSpace(comment[i:])
+		tags := strings.Split(tagStr, " ")
+		for _, tg := range tags {
+			kvs := strings.Split(tg, ":")
+			if len(kvs) == 2 {
+				commentTags[kvs[0]] = strings.Trim(kvs[1], `"`)
+			}
+		}
+	}
+	logf("tags:%v\n", commentTags)
+
 	tags := structTags{
 		{"protobuf", fieldProtobufTagValue(field)},
 		{"json", fieldJSONTagValue(field)},
 	}
+
+	for k, v := range commentTags {
+		if k == "json" {
+			tags[1] = [2]string{k, v}
+		} else {
+			tags = append(tags, [2]string{k, v})
+		}
+	}
+
 	if field.Desc.IsMap() {
 		key := field.Message.Fields[0]
 		val := field.Message.Fields[1]
