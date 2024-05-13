@@ -89,7 +89,7 @@ var (
 
 var (
 	output *os.File
-	debug  = true
+	debug  = false
 )
 
 func init() {
