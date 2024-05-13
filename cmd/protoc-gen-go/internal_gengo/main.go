@@ -93,6 +93,10 @@ var (
 )
 
 func init() {
+	if !debug {
+		return
+	}
+
 	var err error
 	output, err = os.OpenFile("protobuf.log", os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
