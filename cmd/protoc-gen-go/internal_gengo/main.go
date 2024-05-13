@@ -82,7 +82,7 @@ var (
 	// 将为结构体的所有字段生成驼峰式的tag
 	tagMessage = map[string]NameFunc{
 		"@tag-camel-case":  ToCamelCase,
-		"@tag-pascal-case": ToCamelCase,
+		"@tag-pascal-case": ToPascalCase,
 		"@tag-snake-case":  ToSnakeCase,
 	}
 )
