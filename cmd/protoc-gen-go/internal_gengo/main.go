@@ -10,6 +10,8 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"google.golang.org/protobuf/extend/stag"
+	"google.golang.org/protobuf/proto"
 	"math"
 	"os"
 	"strconv"
@@ -65,27 +67,50 @@ var (
 	protoregistryPackage goImportPath = protogen.GoImportPath("google.golang.org/protobuf/reflect/protoregistry")
 )
 
-type NameFunc func(string) string
+type NameConvFunc func(string) string
 
-type TagNameFunc struct {
-	tag string
-	fn  NameFunc
+type TagInfo struct {
+	tag       string
+	omitempty bool
+	fn        NameConvFunc
 }
 
 var (
-	// tag注解，可以用于message的字段上，用于添加结构体注释
-	// 比如： @tag json:"id"
-	tagField = "@tag"
-
-	// tag注解，可以用于message上，用于统一生成某种注释
-	// 比如： @tag-camel-case json
-	// 将为结构体的所有字段生成驼峰式的tag
-	tagMessage = map[string]NameFunc{
-		"@tag-camel-case":  ToCamelCase,
-		"@tag-pascal-case": ToPascalCase,
-		"@tag-snake-case":  ToSnakeCase,
+	nameConvFuncs = map[stag.NamingCase]NameConvFunc{
+		stag.NamingCase_CamelCase:  ToCamelCase,
+		stag.NamingCase_PascalCase: ToPascalCase,
+		stag.NamingCase_SnakeCase:  ToSnakeCase,
 	}
 )
+
+type TagSet struct {
+	m map[string]int
+	s []TagInfo
+}
+
+func NewTagSet() *TagSet {
+	return &TagSet{
+		m: make(map[string]int),
+	}
+}
+
+func (s *TagSet) Len() int {
+	return len(s.m)
+}
+
+func (s *TagSet) Add(info TagInfo) {
+	i, ok := s.m[info.tag]
+	if !ok {
+		s.s = append(s.s, info)
+		s.m[info.tag] = len(s.s) - 1
+		return
+	}
+	s.s[i] = info
+}
+
+func (s *TagSet) TagInfos() []TagInfo {
+	return s.s
+}
 
 var (
 	output *os.File
@@ -107,7 +132,7 @@ func init() {
 
 func logf(format string, a ...interface{}) {
 	if debug {
-		fmt.Fprintf(output, format, a...)
+		fmt.Fprintf(output, format+"\n", a...)
 	}
 }
 
@@ -118,6 +143,11 @@ type goImportPath interface {
 
 // GenerateFile generates the contents of a .pb.go file.
 func GenerateFile(gen *protogen.Plugin, file *protogen.File) *protogen.GeneratedFile {
+	if debug {
+		logf("----------------------------------   [file:%s]  ---------------------------------------", *file.Proto.Name)
+		defer output.Close()
+	}
+
 	filename := file.GeneratedFilenamePrefix + ".pb.go"
 	g := gen.NewGeneratedFile(filename, file.GoImportPath)
 	f := newFileInfo(file)
@@ -147,14 +177,43 @@ func GenerateFile(gen *protogen.Plugin, file *protogen.File) *protogen.Generated
 	for _, enum := range f.allEnums {
 		genEnum(g, f, enum)
 	}
+
+	// 判断文件级别的struct tag
+	// 如果存在选项，则需要在该文件下的所有生成的结构体中添加tag
+	tags := getFileLevelTag(f)
+
 	for _, message := range f.allMessages {
-		genMessage(g, f, message)
+		genMessage(g, f, message, tags)
 	}
 	genExtensions(g, f)
 
 	genReflectFileDescriptor(gen, g, f)
 
 	return g
+}
+
+func getFileLevelTag(f *fileInfo) (res []TagInfo) {
+	tags, ok := proto.GetExtension(f.Desc.Options(), stag.E_StructTags).([]*stag.Tag)
+	if !ok {
+		logf("get file level tags error")
+		return nil
+	}
+
+	for i, t := range tags {
+		if debug {
+			logf("file extension %d, name: %v, format: %v, omitempty: %v", i, t.Name, t.Case, t.Omitempty)
+		}
+
+		res = append(res, TagInfo{
+			tag:       t.Name,
+			omitempty: t.Omitempty,
+			fn:        nameConvFuncs[t.Case],
+		})
+	}
+
+	logf("file level tags: %v", res)
+
+	return res
 }
 
 // genStandaloneComments prints all leading comments for a FileDescriptorProto
@@ -372,7 +431,7 @@ func genEnum(g *protogen.GeneratedFile, f *fileInfo, e *enumInfo) {
 	}
 }
 
-func genMessage(g *protogen.GeneratedFile, f *fileInfo, m *messageInfo) {
+func genMessage(g *protogen.GeneratedFile, f *fileInfo, m *messageInfo, tagInfos []TagInfo) {
 	if m.Desc.IsMapEntry() {
 		return
 	}
@@ -384,11 +443,10 @@ func genMessage(g *protogen.GeneratedFile, f *fileInfo, m *messageInfo) {
 		m.Desc.Options().(*descriptorpb.MessageOptions).GetDeprecated())
 	g.P(leadingComments,
 		"type ", m.GoIdent, " struct {")
-	genMessageFields(g, f, m)
+	// 生成Message字段
+	genMessageFields(g, f, m, tagInfos)
 	g.P("}")
 	g.P()
-
-	logf("r count: %d, n count:%d\n", strings.Count(m.Comments.Leading.String(), "\r"), strings.Count(m.Comments.Leading.String(), "\n"))
 
 	genMessageKnownFunctions(g, f, m)
 	genMessageDefaultDecls(g, f, m)
@@ -396,35 +454,57 @@ func genMessage(g *protogen.GeneratedFile, f *fileInfo, m *messageInfo) {
 	genMessageOneofWrapperTypes(g, f, m)
 }
 
-func getMessageTag(m *messageInfo) (res []TagNameFunc) {
-	comments := strings.Split(m.Comments.Leading.String(), "//")
-	for _, comment := range comments {
-		comment = strings.Trim(comment, " \r\n")
-		for k, _ := range tagMessage {
-			if strings.Contains(comment, k) {
-				fn := tagMessage[k]
-				i := strings.Index(comment, k) + len(k)
-				tg := strings.Trim(comment[i:], " ")
-				res = append(res, TagNameFunc{
-					tag: tg,
-					fn:  fn,
-				})
-				break
-			}
-		}
+func getMessageLevelTag(m *messageInfo) (res []TagInfo) {
+	tags, ok := proto.GetExtension(m.Desc.Options(), stag.E_FieldTags).([]*stag.Tag)
+	if !ok {
+		logf("get message level tag error")
+		return nil
 	}
+
+	for i, t := range tags {
+		if debug {
+			logf("message extension %d, name: %v, format: %v, omitempty: %v", i, t.Name, t.Case, t.Omitempty)
+		}
+
+		res = append(res, TagInfo{
+			tag:       t.Name,
+			omitempty: t.Omitempty,
+			fn:        nameConvFuncs[t.Case],
+		})
+	}
+
+	logf("message level tags: %v", res)
 
 	return
 }
 
-func genMessageFields(g *protogen.GeneratedFile, f *fileInfo, m *messageInfo) {
+func genMessageFields(g *protogen.GeneratedFile, f *fileInfo, m *messageInfo, tagInfos []TagInfo) {
+	if debug {
+		logf("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~   [message:%s]  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~", m.Desc.Name())
+	}
+
 	sf := f.allMessageFieldsByPtr[m]
+	// 生成内部字段，即结构体开头三个未导出字段
 	genMessageInternalFields(g, f, m, sf)
-	// 判断是否要生成tag
-	tagFns := getMessageTag(m)
+
+	// 判断Message级别的Tag
+	tis := getMessageLevelTag(m)
+
+	// 利用map去重并保证有序性，field level > message level > file level
+	tim := NewTagSet()
+	for _, info := range tagInfos {
+		tim.Add(info)
+	}
+
+	for _, info := range tis {
+		tim.Add(info)
+	}
 
 	for _, field := range m.Fields {
-		genMessageField(g, f, m, field, sf, tagFns)
+		genMessageField(g, f, m, field, sf, tim)
+	}
+	if debug {
+		logf("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~  [%s end]  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n", m.Desc.Name())
 	}
 }
 
@@ -448,7 +528,7 @@ func genMessageInternalFields(g *protogen.GeneratedFile, f *fileInfo, m *message
 	}
 }
 
-func genMessageField(g *protogen.GeneratedFile, f *fileInfo, m *messageInfo, field *protogen.Field, sf *structFields, tagFns []TagNameFunc) {
+func genMessageField(g *protogen.GeneratedFile, f *fileInfo, m *messageInfo, field *protogen.Field, sf *structFields, tagSet *TagSet) {
 	if oneof := field.Oneof; oneof != nil && !oneof.Desc.IsSynthetic() {
 		// It would be a bit simpler to iterate over the oneofs below,
 		// but generating the field here keeps the contents of the Go
@@ -485,45 +565,13 @@ func genMessageField(g *protogen.GeneratedFile, f *fileInfo, m *messageInfo, fie
 		goType = "*" + goType
 	}
 
-	commentTags := make(map[string]string)
-	// 处理message上注释中的tag
-	for _, tf := range tagFns {
-		if tf.tag != "" && tf.fn != nil {
-			commentTags[tf.tag] = tf.fn(field.GoName)
-		}
-	}
-
-	// 处理message字段上注释中的tag
-	comments := strings.Split(strings.Trim(field.Comments.Leading.String(), "\r\n"), "//")
-	logf("comments: %v\n", comments)
-	for _, comment := range comments {
-		if !strings.Contains(comment, tagField) {
-			continue
-		}
-		i := strings.Index(comment, tagField) + len(tagField)
-		tagStr := strings.TrimSpace(comment[i:])
-		tags := strings.Split(tagStr, " ")
-		for _, tg := range tags {
-			kvs := strings.Split(tg, ":")
-			if len(kvs) == 2 {
-				commentTags[kvs[0]] = strings.Trim(kvs[1], `"`)
-			}
-		}
-	}
-	logf("tags:%v\n", commentTags)
-
 	tags := structTags{
 		{"protobuf", fieldProtobufTagValue(field)},
 		{"json", fieldJSONTagValue(field)},
 	}
 
-	for k, v := range commentTags {
-		if k == "json" {
-			tags[1] = [2]string{k, v}
-		} else {
-			tags = append(tags, [2]string{k, v})
-		}
-	}
+	// 根据proto中的配置生成tags
+	tags = generateFieldTags(field, tagSet, tags)
 
 	if field.Desc.IsMap() {
 		key := field.Message.Fields[0]
@@ -549,6 +597,74 @@ func genMessageField(g *protogen.GeneratedFile, f *fileInfo, m *messageInfo, fie
 		name, " ", goType, tags,
 		trailingComment(field.Comments.Trailing))
 	sf.append(field.GoName)
+}
+
+func generateFieldTags(field *protogen.Field, set *TagSet, tags [][2]string) (res [][2]string) {
+	// map用于去重
+	m := make(map[string]int)
+	// 解析file级别和message级别的tag
+	for i, info := range set.TagInfos() {
+		m[info.tag] = i
+		t := [2]string{info.tag}
+		t[1] = info.fn(field.GoName)
+		if info.omitempty {
+			t[1] += ",omitempty"
+		}
+		res = append(res, t)
+	}
+
+	// 添加json protobuf等tag，会覆盖file级别和message级别的tag
+	for _, t := range tags {
+		if v, ok := m[t[0]]; ok {
+			// 不覆盖json
+			if t[0] == "json" {
+				continue
+			}
+
+			res[v] = t
+			continue
+		}
+		m[t[0]] = len(res)
+		res = append(res, t)
+	}
+
+	// 解析field级别的tag
+	tgs, ok := proto.GetExtension(field.Desc.Options(), stag.E_Tags).([]string)
+	if !ok {
+		return res
+	}
+
+	// field级别的tag可能为下面的形式：
+	// `form:"user"`   或
+	// `form:user`   或存在多个
+	// `form:user validate:min=8,max=15`
+	for i, t := range tgs {
+		if debug {
+			logf("field extension %d, tag: %s", i, t)
+		}
+
+		pairs := strings.Split(t, " ")
+		for _, pair := range pairs {
+			kv := strings.Split(pair, ":")
+			if len(kv) != 2 {
+				continue
+			}
+
+			k := kv[0]
+			v := strings.Trim(kv[1], `"`)
+			if i, ok := m[k]; ok {
+				res[i] = [2]string{k, v}
+				continue
+			}
+
+			m[k] = len(res)
+			res = append(res, [2]string{k, v})
+		}
+	}
+
+	logf("field: %s, tags: %v", field.GoName, res)
+
+	return res
 }
 
 // genMessageDefaultDecls generates consts and vars holding the default
